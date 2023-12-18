@@ -4,10 +4,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.sql.*;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.Scanner;
 
 /**
  * Class that creates a train system. Sets up the Database and can get the Routes.
@@ -25,7 +24,7 @@ public class Trains {
     private final String dbName = "trains";
 
     // List of Routes the system currently knows about.
-    private final List<Route> routes = new ArrayList<>();
+    private final Map<Integer, Route> routes = new HashMap<>();
 
     /**
      * Constructor for Trains object.
@@ -38,22 +37,56 @@ public class Trains {
 
         this.db = db;
 
-        this.db.createDatabase(this.dbName, true);
+
+        // Check if the db exists
+        boolean dbExists;
+
+        try (PreparedStatement stmt = this.db.prepareStatement(
+                "SELECT count(*) as 'dbExists' FROM `information_schema`.`schemata` WHERE `schema_name` = '" + this.dbName + "'")) {
+            ResultSet rs = stmt.executeQuery();
+            rs.first();
+
+            dbExists = rs.getBoolean("dbExists");
+
+            rs.close();
+        }
+
+        // If the db does not exist create it.
+        if (!dbExists) {
+            this.db.createDatabase(this.dbName);
+        }
+
         this.db.use(this.dbName);
-        this.createTables();
-        this.insertInitialData();
+
+
+        // Check if the tables exist!
+        int counter;
+
+        try (PreparedStatement stmt = this.db.prepareStatement(
+                "SELECT count(*) as 'count' FROM `information_schema`.`tables` WHERE `table_schema` = '" + this.dbName + "' AND `table_name` IN ('city', 'platform', 'route', 'station', 'train', 'traintype', 'train_has_platform');")) {
+            ResultSet rs = stmt.executeQuery();
+            rs.first();
+
+            counter = rs.getInt("count");
+
+            rs.close();
+        }
+
+        // If the amount of tables does not match the expected amount recreate all tables.
+        if (counter != 7) {
+            log.warn("Not enough tables, creating Tables!");
+            this.createTables();
+            this.insertInitialData();
+        }
     }
 
     /**
      * Get the current Routes from the database.
      *
-     * @return An array of Routes, fresh from the database.
      * @throws SQLException If querying for routes failed.
      */
-    public Route[] updateRoutes() throws SQLException {
+    public void updateRoutes() throws SQLException {
         this.db.use(this.dbName);
-
-        this.routes.clear();
 
         try (PreparedStatement statement = this.db.prepareStatement(
                 "SELECT idroute, arrival, departure, train_nrtrain,direction FROM route")) {
@@ -61,22 +94,17 @@ public class Trains {
             ResultSet results = statement.executeQuery();
 
             while (results.next()) {
-                this.routes.add(new Route(
+                int routeId = results.getInt("idroute");
+                this.routes.put(routeId, new Route(
                         this.db,
                         this.dbName,
-                        results.getInt("idroute"),
+                        routeId,
                         results.getTimestamp("departure"),
                         results.getTimestamp("arrival"),
                         results.getInt("train_nrtrain"),
                         results.getBoolean("direction")
                 ));
             }
-
-            Route[] routesArray = new Route[this.routes.size()];
-
-            this.routes.toArray(routesArray);
-
-            return routesArray;
         }
     }
 
@@ -85,12 +113,206 @@ public class Trains {
      *
      * @return An array of Routes, not fresh from the database.
      */
-    public Route[] getRoutes() {
-        Route[] routesArray = new Route[this.routes.size()];
+    public Map<Integer, Route> getRoutes() {
+        return this.routes;
+    }
 
-        this.routes.toArray(routesArray);
+    /**
+     * Get a specific Route from the Routes.
+     *
+     * @param routeId The id of the Route to get.
+     * @return The Route that was requested.
+     */
+    public Route getRoute(Integer routeId) {
+        return this.routes.get(routeId);
+    }
 
-        return routesArray;
+    /**
+     * Insert a new Route into the Database and then return the resulting Route.
+     *
+     * @param scan Scanner to handle Input.
+     * @return The new Route that was inserted.
+     * @throws SQLException If there was an issue inserting into the Database.
+     */
+    public Route createRoute(Scanner scan) throws SQLException {
+        Integer trainNr = this.chooseTrain(scan);
+        Map<Integer, String[]> platforms = this.getPlatforms(trainNr);
+        Boolean direction = this.chooseDirection(platforms, scan);
+        Timestamp departure = this.chooseTimestamp(true, scan);
+        Timestamp arrival = this.chooseTimestamp(false, scan);
+        int insertedRoute;
+
+        try (PreparedStatement statement = this.db.getConnection().prepareStatement(
+                "INSERT INTO route (arrival, departure, direction, train_nrtrain) VALUES (?, ?, ?, ?)",
+                Statement.RETURN_GENERATED_KEYS
+        )) {
+            statement.setTimestamp(1, arrival);
+            statement.setTimestamp(2, departure);
+            statement.setBoolean(3, direction);
+            statement.setInt(4, trainNr);
+
+            statement.executeUpdate();
+
+            try (ResultSet rs = statement.getGeneratedKeys()) {
+                rs.first();
+
+                insertedRoute = rs.getInt(1);
+            }
+        }
+
+        this.updateRoutes();
+
+        return this.routes.get(insertedRoute);
+    }
+
+    /**
+     * Ask the user to enter a timestamp for the Route.
+     *
+     * @param start Are we asking for the departure or arrival Timestamp?
+     * @param scan  Scanner to handle Input.
+     * @return The Timestamp the user has entered.
+     */
+    private Timestamp chooseTimestamp(Boolean start, Scanner scan) {
+        Timestamp timestamp = null;
+
+        do {
+            System.out.println("Please input a " + (start ? "departure" : "arrival") + " timestamp (yyyy-mm-dd hh:mm):");
+
+            try {
+                Thread.sleep(1000);
+                String timeString = scan.nextLine() + ":00";
+                timestamp = Timestamp.valueOf(timeString);
+            } catch (IllegalArgumentException | InterruptedException ignored) {
+                System.out.println("Erroneous timestamp entered, try again!");
+            }
+        } while (timestamp == null);
+
+        return timestamp;
+    }
+
+    /**
+     * Choose the direction to use for the Route.
+     *
+     * @param platforms A Map of platforms.
+     * @param scan      Scanner to handle Input.
+     * @return True if the direction is forwards, false if it is backwards.
+     */
+    private Boolean chooseDirection(Map<Integer, String[]> platforms, Scanner scan) {
+        Boolean chosen = null;
+        Map<Boolean, String> directions = new HashMap<>() {{
+            put(true, " --> ");
+            put(false, " --> ");
+        }};
+
+        for (int platform : platforms.keySet()) {
+            String[] val = platforms.get(platform);
+
+            if (val[1].equals("0")) {
+                directions.put(true, val[0] + directions.get(true));
+                directions.put(false, directions.get(false) + val[0]);
+            }
+
+            if (val[1].equals("1")) {
+                directions.put(true, directions.get(true) + val[0]);
+                directions.put(false, val[0] + directions.get(false));
+            }
+        }
+
+        for (Boolean direction : directions.keySet()) {
+            System.out.println((direction ? "Forwards (f): " : "Backwards (b): ") + directions.get(direction));
+        }
+
+        do {
+            System.out.println("Choose a direction! (f|b)");
+            String selected = scan.next();
+
+            switch (selected) {
+                case "f", "F" -> chosen = true;
+                case "b", "B" -> chosen = false;
+            }
+        } while (!directions.containsKey(chosen));
+
+        return chosen;
+    }
+
+    /**
+     * Get the platforms from the Database.
+     *
+     * @param trainNr The trainNr to get the platforms for.
+     * @return A Map of platforms.
+     * @throws SQLException If selecting the platforms fails.
+     */
+    private Map<Integer, String[]> getPlatforms(Integer trainNr) throws SQLException {
+        this.db.use(this.dbName);
+
+        Map<Integer, String[]> platforms = new HashMap<>();
+
+        try (PreparedStatement statement = this.db.prepareStatement(
+                "SELECT p.nr as 'nr', s.name as 'station', c.name as 'city', t.start as 'start' FROM train_has_platform t LEFT JOIN platform p on t.platform_idplatform = p.idplatform LEFT JOIN station s on p.station_idstation = s.idstation LEFT JOIN city c on s.idstation = c.station_idstation WHERE t.train_nrtrain = ?")) {
+            statement.setInt(1, trainNr);
+            ResultSet rs = statement.executeQuery();
+
+            while (rs.next()) {
+                int nr = rs.getInt("nr");
+                String[] details = {
+                        rs.getString("station") + " " + nr + " " + rs.getString("city"), rs.getString("start")
+                };
+
+                platforms.put(nr, details);
+            }
+        }
+
+        return platforms;
+    }
+
+    /**
+     * Choosing the train to use for the new Route.
+     *
+     * @param scan Scanner to handle Input.
+     * @return The number of the chosen train.
+     * @throws SQLException If there is an issue getting the trains from the database.
+     */
+    private Integer chooseTrain(Scanner scan) throws SQLException {
+        this.db.use(this.dbName);
+
+        Map<Integer, String> trains = this.getTrains();
+        Integer chosen = null;
+
+        for (int train : trains.keySet()) {
+            System.out.println(train + "-->" + trains.get(train));
+        }
+
+        do {
+            if (chosen != null) System.out.println("Invalid train number...");
+            System.out.println("Choose a train!");
+
+            chosen = scan.nextInt();
+        } while (!trains.containsKey(chosen));
+
+        return chosen;
+    }
+
+    /**
+     * Get a list of trains from the database.
+     *
+     * @return A Map of trains.
+     * @throws SQLException If there was an error selecting the trains from the database.
+     */
+    private Map<Integer, String> getTrains() throws SQLException {
+        this.db.use(this.dbName);
+
+        try (PreparedStatement statement = this.db.prepareStatement(
+                "SELECT t.nrtrain as 'trainNr', tt.name as 'name' FROM train t LEFT JOIN traintype tt ON tt.idtraintype = t.traintype_idtraintype")) {
+            ResultSet rs = statement.executeQuery();
+
+            Map<Integer, String> trains = new HashMap<>();
+
+            while (rs.next()) {
+                trains.put(rs.getInt("trainNr"), rs.getString("name"));
+            }
+
+            return trains;
+        }
     }
 
     /**
@@ -106,7 +328,7 @@ public class Trains {
                     "`idstation` INT NOT NULL AUTO_INCREMENT",
                     "`name` VARCHAR(45) NOT NULL",
                     "PRIMARY KEY (`idstation`)"
-            }, true);
+            });
 
             this.db.createTable("city", new String[]{
                     "`idcity` INT NOT NULL AUTO_INCREMENT",
@@ -115,7 +337,7 @@ public class Trains {
                     "PRIMARY KEY (`idcity`)",
                     "INDEX `fk_city_station1_idx` (`station_idstation` ASC)",
                     "CONSTRAINT `fk_city_station1` FOREIGN KEY (`station_idstation`) REFERENCES `trains`.`station` (`idstation`) ON DELETE NO ACTION ON UPDATE NO ACTION"
-            }, true);
+            });
 
             this.db.createTable("platform", new String[]{
                     "`idplatform` INT NOT NULL AUTO_INCREMENT",
@@ -124,13 +346,13 @@ public class Trains {
                     "PRIMARY KEY (`idplatform`)",
                     "INDEX `fk_platform_station1_idx` (`station_idstation` ASC)",
                     "CONSTRAINT `fk_platform_station1` FOREIGN KEY (`station_idstation`) REFERENCES `trains`.`station` (`idstation`) ON DELETE NO ACTION ON UPDATE NO ACTION"
-            }, true);
+            });
 
             this.db.createTable("traintype", new String[]{
                     "`idtraintype` INT NOT NULL AUTO_INCREMENT",
                     "`name` VARCHAR(45) NOT NULL",
                     "PRIMARY KEY (`idtraintype`)"
-            }, true);
+            });
 
             this.db.createTable("train", new String[]{
                     "`nrtrain` INT NOT NULL AUTO_INCREMENT",
@@ -139,7 +361,7 @@ public class Trains {
                     "PRIMARY KEY (`nrtrain`)",
                     "INDEX `fk_train_traintype_idx` (`traintype_idtraintype` ASC)",
                     "CONSTRAINT `fk_train_traintype` FOREIGN KEY (`traintype_idtraintype`) REFERENCES `trains`.`traintype` (`idtraintype`) ON DELETE NO ACTION ON UPDATE NO ACTION "
-            }, true);
+            });
 
             this.db.createTable("train_has_platform", new String[]{
                     "`train_nrtrain` INT NOT NULL",
@@ -150,7 +372,7 @@ public class Trains {
                     "INDEX `fk_train_has_platform_train1_idx` (`train_nrtrain` ASC)",
                     "CONSTRAINT `fk_train_has_platform_train1` FOREIGN KEY (`train_nrtrain`) REFERENCES `trains`.`train` (`nrtrain`) ON DELETE NO ACTION ON UPDATE NO ACTION",
                     "CONSTRAINT `fk_train_has_platform_platform1` FOREIGN KEY (`platform_idplatform`) REFERENCES `trains`.`platform` (`idplatform`) ON DELETE NO ACTION ON UPDATE NO ACTION"
-            }, true);
+            });
 
             this.db.createTable("route", new String[]{
                     "`idroute` INT NOT NULL AUTO_INCREMENT",
@@ -161,7 +383,7 @@ public class Trains {
                     "PRIMARY KEY (`idroute`)",
                     "INDEX `fk_route_train1_idx` (`train_nrtrain` ASC)",
                     "CONSTRAINT `fk_route_train1` FOREIGN KEY (`train_nrtrain`) REFERENCES `trains`.`train` (`nrtrain`) ON DELETE NO ACTION ON UPDATE NO ACTION"
-            }, true);
+            });
         } catch (SQLException e) {
             String errorMessage = "Failed creating tables: " + e.getMessage();
             log.error(errorMessage);
@@ -407,5 +629,27 @@ public class Trains {
 
             statement.executeBatch();
         }
+    }
+
+    /**
+     * Convert the Trains-System to a String by converting all the internal Routes to a String.
+     *
+     * @return A string representation of the Trains-System.
+     */
+    @Override
+    public String toString() {
+        if (this.routes.isEmpty()) {
+            String warningMessage = "Currently no Routes in the Train-System, please update the Routes!";
+            log.warn(warningMessage);
+            return warningMessage;
+        }
+
+        StringBuilder routesStringBuilder = new StringBuilder();
+
+        for (int route : this.routes.keySet()) {
+            routesStringBuilder.append(this.routes.get(route));
+        }
+
+        return routesStringBuilder.toString();
     }
 }

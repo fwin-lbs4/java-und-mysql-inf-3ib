@@ -13,6 +13,7 @@ import java.sql.*;
 public class Database {
     // Logger for the Database-Class.
     private static final Logger log = LogManager.getLogger(Database.class);
+
     // The Connection to the database.
     private final Connection connection;
 
@@ -145,6 +146,16 @@ public class Database {
      */
     public PreparedStatement prepareStatement(String statement) throws SQLException {
         return this.connection.prepareStatement(statement);
+    }
+
+    /**
+     * Get the Connection to the database.
+     * For example: to use for methods directly on the Connection.
+     *
+     * @return The Connection to the Database.
+     */
+    public Connection getConnection() {
+        return this.connection;
     }
 
     /**
